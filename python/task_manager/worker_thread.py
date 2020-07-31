@@ -56,12 +56,16 @@ class WorkerThread(QtCore.QThread):
             self._results_dispatcher = None
             self._process_tasks = False
             self._wait_condition.notifyAll()
-        self.wait()
+        # self.wait()
 
     def run(self):
         """
         The main thread run function.  Loops over tasks until asked to exit.
         """
+        # Uncomment to allow debug breakpoints in the thread that executes` run().
+        # import ptvsd
+        # ptvsd.debug_this_thread()
+
         try:
             while True and self._results_dispatcher is not None:
                 # get the next task to process:

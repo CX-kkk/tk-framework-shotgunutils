@@ -23,7 +23,7 @@ from .results_poller import ResultsDispatcher
 # Set to True to enable extensive debug logging.
 # Useful for debugging concurrency issues.
 # Do not release with this setting set to True!
-ENABLE_DETAILED_DEBUG = False
+ENABLE_DETAILED_DEBUG = True
 
 
 class BackgroundTaskManager(QtCore.QObject):
@@ -57,6 +57,10 @@ class BackgroundTaskManager(QtCore.QObject):
     # signal emitted when all tasks in a group have finished
     task_group_finished = QtCore.Signal(object)  # group
 
+    # For Option 1 only
+    # signal emitted when all worker threads have shut down and the task manager shut down has fully completed
+    shut_down_complete = QtCore.Signal()
+
     def __init__(self, parent, start_processing=False, max_threads=8):
         """
         :param parent:              The parent QObject for this instance
@@ -73,6 +77,8 @@ class BackgroundTaskManager(QtCore.QObject):
         self._next_group_id = 0
 
         self._can_process_tasks = start_processing
+        self._is_shutting_down = False
+        self._all_threads_shut_down = False
 
         # the pending tasks, organized by priority
         self._pending_tasks_by_priority = {}
@@ -97,6 +103,8 @@ class BackgroundTaskManager(QtCore.QObject):
             self._on_worker_thread_task_completed
         )
         self._results_dispatcher.task_failed.connect(self._on_worker_thread_task_failed)
+        # For Option 1 only
+        self._results_dispatcher.finished.connect(self._on_results_dispatcher_shutdown_complete)
         self._results_dispatcher.start()
 
     def next_group_id(self):
@@ -152,6 +160,7 @@ class BackgroundTaskManager(QtCore.QObject):
         threads.  Completion/failure of any currently running tasks will be ignored.
         """
         self._debug_log("Shutting down...")
+        self._is_shutting_down = True
         self._can_process_tasks = False
 
         # stop all tasks:
@@ -161,14 +170,69 @@ class BackgroundTaskManager(QtCore.QObject):
         self._debug_log(
             "Waiting for %d background threads to stop..." % len(self._all_threads)
         )
-        for thread in self._all_threads:
-            thread.shut_down()
+        # for thread in self._all_threads:
+        #     thread.shut_down()
+        #
+        # Alternative to the above commented out code block:
+        #
+        # Option 1: listen for shut down signal from each thread and shut them down synchronously
+        # then once all are shut down we shut down the results dispatcher, then bg task manager
+        # will emit shut down complete signal (Note that currently apps do not wait for the
+        # dispatcher to fully shut down)
+        # self._shut_down_next_thread()
+        #
+        # Option 2: add blocking while loop to process the events while waiting for each thread
+        # to shut down -- add this here, or should the caller be responsible for blocking? do we
+        # also need to add this mechanism to wait for the results dispatcher to complete?
+        self._debug_log("[DEV] wait until we've recieved all finished signals from threads shutting down")
+        self._all_threads_shut_down = False
+        self._shut_down_next_thread()
+        while not self._all_threads_shut_down:
+            # Process events while waiting for threads to all shut down
+            QtCore.QCoreApplication.processEvents()
+
         self._available_threads = []
         self._all_threads = []
 
         # Shut down the dispatcher thread
         self._results_dispatcher.shut_down()
+        while self._is_shutting_down:
+            # Process events while waiting for results dispatcher thread to shut down
+            QtCore.QCoreApplication.processEvents()
+
         self._debug_log("Shut down successfully!")
+
+    def _shut_down_next_thread(self):
+        """
+        Shut down the thread the appears last in the list of all threads, if any. If there
+        are no threads left to shut down and the task manager is in the process of shutting down,
+        clear the availble threads and shut down the results dispatcher.
+        """
+        if self._all_threads:
+            self._all_threads.pop().shut_down()
+        elif self._is_shutting_down:
+            # Option 1:
+            # self._available_threads = []
+            # self._results_dispatcher.shut_down()
+            #
+            # Option 2:
+            self._all_threads_shut_down = True
+
+    def _on_thread_finished(self):
+        if self._is_shutting_down:
+            self._shut_down_next_thread()
+
+    def _on_results_dispatcher_shutdown_complete(self):
+        """
+        The task manager shut down process will end with the shutting down the results dispatcher, so
+        signal shut down complete if in fact the task manager is in the process of shutting down. Set the
+        shut down flag to False since this is the last step.
+        """
+        if self._is_shutting_down:
+            self._is_shutting_down = False
+            # For Option 1 only
+            # self.shut_down_complete.emit()
+            # self._debug_log("Shut down successfully!")
 
     def add_task(
         self,
@@ -390,6 +454,8 @@ class BackgroundTaskManager(QtCore.QObject):
             )
             return None
         self._all_threads.append(thread)
+
+        thread.finished.connect(self._on_thread_finished)
 
         # start the thread - this will just put it into wait mode:
         thread.start()
